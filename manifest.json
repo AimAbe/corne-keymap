@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "aimabe.corne-keymap",
+  "name": "Corne Keymap",
+  "version": "0.1.0",
+  "author": "aimen",
+  "license": "MIT",
+  "description": "Visual Corne v4 keyboard in the bar: click a key, pick a keycode, and it's written to the board over VIA/Vial",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Corne Keymap",
+    "description": "Remap your Corne v4 live: layers, mod-taps, layer keys, backups",
+    "category": "System",
+    "defaultSection": "right",
+    "allowMultiple": false,
+    "schema": [
+      {
+        "key": "demo",
+        "type": "boolean",
+        "label": "Demo mode",
+        "description": "Edit a simulated Corne stored in ~/.local/state/omarchy/corne-keymap/demo.json instead of the real keyboard.",
+        "defaultValue": false
+      }
+    ]
+  }
+}

@@ -1,0 +1,578 @@
+#!/usr/bin/python3
+"""Talk to a Corne v4 (or any VIA/Vial keyboard) over raw HID.
+
+Stdlib only, so the plugin needs nothing installed beyond python3. Every
+command prints one JSON object on stdout; the QML panel parses that and never
+has to understand HID.
+
+  cornectl [--demo] dump                    layout + every layer's keycodes
+  cornectl [--demo] set [--backup-first] L R C CODE [...]
+                                            write keycodes (groups of four),
+                                            reading each back to confirm
+  cornectl [--demo] backup                  save the keymap, print its path
+  cornectl [--demo] restore FILE            write a backup back to the board
+  cornectl watch                            stream pressed switches, one JSON
+                                            line per change (matrix tester)
+  cornectl unlock                           Vial unlock: stream progress while
+                                            the user holds the unlock keys
+  cornectl udev-rule                        print the udev rule for hidraw access
+
+--demo swaps the keyboard for a JSON file under the state dir, so the panel
+can be tried (and tested) with no hardware plugged in.
+"""
+
+import glob
+import json
+import lzma
+import os
+import select
+import sys
+import time
+
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "omarchy", "corne-keymap")
+BACKUP_DIR = os.path.join(STATE_DIR, "backups")
+DEMO_FILE = os.path.join(STATE_DIR, "demo.json")
+
+FOOSTAN_VID = 0x4653  # foostan, maker of the Corne
+REPORT_SIZE = 32
+
+# VIA command ids
+CMD_PROTOCOL_VERSION = 0x01
+CMD_GET_KEYBOARD_VALUE = 0x02
+VALUE_SWITCH_MATRIX = 0x03
+CMD_GET_KEYCODE = 0x04
+CMD_SET_KEYCODE = 0x05
+CMD_LAYER_COUNT = 0x11
+CMD_VIAL = 0xFE
+VIAL_GET_KEYBOARD_ID = 0x00
+VIAL_GET_SIZE = 0x01
+VIAL_GET_DEF = 0x02
+VIAL_GET_UNLOCK_STATUS = 0x05
+VIAL_UNLOCK_START = 0x06
+VIAL_UNLOCK_POLL = 0x07
+
+# Corne v4 matrix, for firmware that doesn't describe itself.
+DEFAULT_MATRIX = (8, 7)
+
+UDEV_RULE = (
+    '# Let the logged-in user talk raw HID to foostan keyboards (Corne) for VIA/Vial remapping\n'
+    'KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="4653", MODE="0660", TAG+="uaccess"\n'
+)
+
+
+class HelperError(Exception):
+    def __init__(self, code, message, hint=""):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.hint = hint
+
+
+# --------------------------------------------------------------- layout
+
+def _key(row, col, x, y, w=1.0, h=1.0, r=0.0, rx=None, ry=None):
+    # Rotation defaults to the key's own centre so fallback thumbs can fan
+    # out without dragging the whole cluster around.
+    return {"row": row, "col": col, "x": x, "y": y, "w": w, "h": h, "r": r,
+            "rx": x + w / 2 if rx is None else rx,
+            "ry": y + h / 2 if ry is None else ry}
+
+
+def fallback_layout():
+    """Corne v4 (crkbd rev4_0, LAYOUT_split_3x6_3_ex2): 46 keys, 8x7 matrix.
+
+    Used when the firmware is plain VIA and can't describe itself. Matrix
+    columns are mirrored on the right half (column 0 is the outer edge on both
+    sides), which is how the reversible PCB is wired.
+    """
+    stagger = [0.35, 0.35, 0.12, 0.0, 0.12, 0.24]  # pinky .. index, per column
+    right_x0 = 8.6
+    keys = []
+    for r in range(3):
+        for c in range(6):
+            keys.append(_key(r, c, c, r + stagger[c]))
+    keys.append(_key(0, 6, 6, 0.5))
+    keys.append(_key(1, 6, 6, 1.5))
+    for r in range(3):
+        for c in range(6):
+            keys.append(_key(4 + r, 5 - c, right_x0 + 1 + c, r + stagger[5 - c]))
+    keys.append(_key(4, 6, right_x0, 0.5))
+    keys.append(_key(5, 6, right_x0, 1.5))
+    thumbs = [(3.6, 3.45, 0), (4.7, 3.5, 8), (5.8, 3.65, 18)]
+    for i, (x, y, rot) in enumerate(thumbs):
+        keys.append(_key(3, 3 + i, x, y, r=rot))
+    for i, (x, y, rot) in enumerate(reversed(thumbs)):
+        mirrored_x = right_x0 + 7 - x - 1 + 0.0
+        keys.append(_key(7, 5 - i, mirrored_x, y, r=-rot))
+    return keys
+
+
+def parse_kle(rows):
+    """Parse the KLE-style `layouts.keymap` from a Vial definition.
+
+    Follows kle-serial's cursor rules: `rx`/`ry` start a rotation cluster and
+    reset the cursor to it, each row ends by returning x to the cluster's x.
+    The first legend is "row,col"; the fourth, when present, is a layout
+    option "group,choice" and only choice 0 is kept.
+    """
+    keys = []
+    r = rx = ry = 0.0
+    x = y = 0.0
+    w = h = 1.0
+    decal = False
+    for row in rows:
+        if not isinstance(row, list):
+            continue
+        for item in row:
+            if isinstance(item, dict):
+                if "r" in item:
+                    r = float(item["r"])
+                if "rx" in item:
+                    rx = float(item["rx"])
+                    x, y = rx, ry
+                if "ry" in item:
+                    ry = float(item["ry"])
+                    x, y = rx, ry
+                x += float(item.get("x", 0))
+                y += float(item.get("y", 0))
+                w = float(item.get("w", w))
+                h = float(item.get("h", h))
+                decal = bool(item.get("d", decal))
+                continue
+            labels = str(item).split("\n")
+            option = labels[3] if len(labels) > 3 else ""
+            keep = not decal
+            if option and "," in option:
+                keep = keep and option.split(",")[1].strip() == "0"
+            matrix = labels[0].split(",")
+            if keep and len(matrix) == 2:
+                try:
+                    keys.append({"row": int(matrix[0]), "col": int(matrix[1]),
+                                 "x": x, "y": y, "w": w, "h": h, "r": r,
+                                 "rx": rx, "ry": ry})
+                except ValueError:
+                    pass
+            x += w
+            w = h = 1.0
+            decal = False
+        y += 1
+        x = rx
+    return keys
+
+
+# --------------------------------------------------------------- transports
+
+def find_device():
+    """Return (hidraw path, product name) of the best VIA-capable interface.
+
+    VIA's raw HID interface is identified by usage page 0xFF60, usage 0x61 in
+    its report descriptor. Foostan's vendor id wins when several match.
+    """
+    found = []
+    for sys_dir in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        try:
+            with open(os.path.join(sys_dir, "device", "report_descriptor"), "rb") as f:
+                desc = f.read()
+            with open(os.path.join(sys_dir, "device", "uevent")) as f:
+                uevent = dict(line.strip().split("=", 1) for line in f if "=" in line)
+        except OSError:
+            continue
+        if b"\x06\x60\xff\x09\x61" not in desc:
+            continue
+        # HID_ID=0003:00004653:00000004
+        parts = uevent.get("HID_ID", "0:0:0").split(":")
+        vid = int(parts[1], 16) if len(parts) > 1 else 0
+        name = uevent.get("HID_NAME", "Keyboard")
+        rank = 0 if vid == FOOSTAN_VID or "corne" in name.lower() else 1
+        found.append((rank, "/dev/" + os.path.basename(sys_dir), name))
+    if not found:
+        raise HelperError("not-found", "No VIA/Vial keyboard found",
+                          "Plug in the Corne over USB. Wireless (BLE) Cornes run ZMK and can't be remapped live.")
+    found.sort()
+    return found[0][1], found[0][2]
+
+
+class HidTransport:
+    def __init__(self, path):
+        try:
+            self.fd = os.open(path, os.O_RDWR)
+        except PermissionError:
+            raise HelperError("permission", "No permission to open " + path,
+                              "Install the udev rule (see README), then replug the keyboard.")
+
+    def xfer(self, payload):
+        # Every open hidraw fd sees every reply, so another cornectl (the
+        # watcher) may have left answers queued here. Drop them first.
+        while select.select([self.fd], [], [], 0)[0]:
+            os.read(self.fd, REPORT_SIZE)
+        buf = bytes(payload) + b"\x00" * (REPORT_SIZE - len(payload))
+        os.write(self.fd, b"\x00" + buf)  # leading 0 = report id
+        deadline = time.monotonic() + 0.5
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise HelperError("timeout", "Keyboard didn't answer")
+            ready, _, _ = select.select([self.fd], [], [], left)
+            if ready:
+                data = os.read(self.fd, REPORT_SIZE)
+                # Unrelated reports can be queued; VIA echoes the command id.
+                if payload[0] == CMD_VIAL or data[:1] == bytes(payload[:1]):
+                    return data
+
+    def close(self):
+        os.close(self.fd)
+
+
+class Keyboard:
+    """VIA protocol on top of any transport exposing xfer(bytes) -> bytes."""
+
+    def __init__(self, transport, name="Corne v4", path=""):
+        self.t = transport
+        self.name = name
+        self.path = path
+
+    def protocol(self):
+        d = self.t.xfer([CMD_PROTOCOL_VERSION])
+        return d[1] << 8 | d[2]
+
+    def layer_count(self):
+        return self.t.xfer([CMD_LAYER_COUNT])[1]
+
+    def get(self, layer, row, col):
+        d = self.t.xfer([CMD_GET_KEYCODE, layer, row, col])
+        return d[4] << 8 | d[5]
+
+    def set(self, layer, row, col, code):
+        self.t.xfer([CMD_SET_KEYCODE, layer, row, col, (code >> 8) & 0xFF, code & 0xFF])
+
+    def matrix(self, rows, cols):
+        """Return the pressed switches as ["row,col", ...].
+
+        VIA packs each row big-endian into ceil(cols / 8) bytes, bit n = col n.
+        """
+        width = (cols + 7) // 8
+        if width * rows > REPORT_SIZE - 2:
+            raise HelperError("unsupported", "Matrix too large for the VIA matrix tester")
+        d = self.t.xfer([CMD_GET_KEYBOARD_VALUE, VALUE_SWITCH_MATRIX])
+        pressed = []
+        for r in range(rows):
+            bits = int.from_bytes(d[2 + r * width:2 + (r + 1) * width], "big")
+            pressed += ["%d,%d" % (r, c) for c in range(cols) if bits >> c & 1]
+        return pressed
+
+    def lock_status(self):
+        """Return (unlocked, [[row, col], ...] keys to hold to unlock)."""
+        d = self.t.xfer([CMD_VIAL, VIAL_GET_UNLOCK_STATUS])
+        keys = []
+        for i in range(2, REPORT_SIZE - 1, 2):
+            if d[i] == 0xFF:
+                break
+            keys.append([d[i], d[i + 1]])
+        return bool(d[0]), keys
+
+    def unlock_start(self):
+        self.t.xfer([CMD_VIAL, VIAL_UNLOCK_START])
+
+    def unlock_poll(self):
+        """Return (unlocked, in progress, counter); counter falls to 0 while the keys are held."""
+        d = self.t.xfer([CMD_VIAL, VIAL_UNLOCK_POLL])
+        return bool(d[0]), bool(d[1]), d[2]
+
+    def vial_definition(self):
+        """Return (vial protocol, parsed definition) or (None, None) on plain VIA."""
+        d = self.t.xfer([CMD_VIAL, VIAL_GET_KEYBOARD_ID])
+        version = int.from_bytes(d[0:4], "little")
+        # Plain VIA answers unknown commands with id_unhandled (0xFF) and
+        # echoes the payload, which reads back as a nonsense version.
+        if d[0] == 0xFF or version == 0 or version > 0xFFFF:
+            return None, None
+        size = int.from_bytes(self.t.xfer([CMD_VIAL, VIAL_GET_SIZE])[0:4], "little")
+        blob = b""
+        page = 0
+        while len(blob) < size:
+            blob += self.t.xfer([CMD_VIAL, VIAL_GET_DEF, page & 0xFF, page >> 8])
+            page += 1
+        try:
+            return version, json.loads(lzma.decompress(blob[:size]))
+        except (lzma.LZMAError, ValueError):
+            return version, None
+
+
+class DemoKeyboard(Keyboard):
+    """Keyboard stand-in backed by a JSON file with a stock-ish Corne keymap."""
+
+    def __init__(self):
+        self.name = "Corne v4 (demo)"
+        self.path = DEMO_FILE
+        if os.path.exists(DEMO_FILE):
+            with open(DEMO_FILE) as f:
+                self.map = json.load(f)
+        else:
+            self.map = demo_keymap()
+            self._save()
+
+    def _save(self):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(DEMO_FILE, "w") as f:
+            json.dump(self.map, f)
+
+    def protocol(self):
+        return 12
+
+    def layer_count(self):
+        return len(self.map)
+
+    def get(self, layer, row, col):
+        return self.map[layer].get("%d,%d" % (row, col), 0)
+
+    def set(self, layer, row, col, code):
+        self.map[layer]["%d,%d" % (row, col)] = code
+        self._save()
+
+    def vial_definition(self):
+        return 6, None
+
+
+def demo_keymap():
+    # Keycodes for the classic Corne default: QWERTY, lower (numbers/nav),
+    # raise (symbols), adjust (F-keys/media). Written as rows of the visible
+    # layout, left half then right half, so they're easy to eyeball.
+    B = {c: 0x04 + i for i, c in enumerate("abcdefghijklmnopqrstuvwxyz")}
+    N = {str((i + 1) % 10): 0x1E + i for i in range(10)}
+    TAB, ESC, BSPC, ENT, SPC, LSFT, LCTL, LGUI, RALT = 0x2B, 0x29, 0x2A, 0x28, 0x2C, 0xE1, 0xE0, 0xE3, 0xE6
+    SCLN, QUOT, COMM, DOT, SLSH, MINS, EQL, LBRC, RBRC, BSLS, GRV = 0x33, 0x34, 0x36, 0x37, 0x38, 0x2D, 0x2E, 0x2F, 0x30, 0x31, 0x35
+    LEFT, DOWN, UP, RGHT = 0x50, 0x51, 0x52, 0x4F
+    TR, NO = 0x01, 0x00
+    MO = lambda n: 0x5220 | n
+    S = lambda k: 0x0200 | k
+    F = lambda n: 0x3A + n - 1
+
+    def layer(l0, l1, l2, r0, r1, r2, lt, rt, lex=(NO, NO), rex=(NO, NO)):
+        m = {}
+        for r, row in enumerate((l0, l1, l2)):
+            for c, code in enumerate(row):
+                m["%d,%d" % (r, c)] = code
+        for r, row in enumerate((r0, r1, r2)):
+            for c, code in enumerate(row):
+                m["%d,%d" % (4 + r, 5 - c)] = code
+        for i, code in enumerate(lt):
+            m["3,%d" % (3 + i)] = code
+        for i, code in enumerate(rt):
+            m["7,%d" % (5 - i)] = code
+        m["0,6"], m["1,6"] = lex
+        m["4,6"], m["5,6"] = rex
+        return m
+
+    q = [B[c] for c in "qwertasdfgzxcvb"]
+    p = [B[c] for c in "yuiophjkl"] + [SCLN] + [B[c] for c in "nm"] + [COMM, DOT, SLSH]
+    base = layer([TAB] + q[0:5], [LCTL] + q[5:10], [LSFT] + q[10:15],
+                 p[0:5] + [BSPC], p[5:10] + [QUOT], p[10:15] + [ESC],
+                 [LGUI, MO(1), SPC], [ENT, MO(2), RALT], (MINS, LBRC), (EQL, RBRC))
+    nums = [N[str(i)] for i in (1, 2, 3, 4, 5, 6, 7, 8, 9, 0)]
+    lower = layer([TAB] + nums[0:5], [LCTL] + [NO] * 5, [LSFT] + [NO] * 5,
+                  nums[5:10] + [BSPC], [LEFT, DOWN, UP, RGHT, NO, NO], [NO] * 6,
+                  [LGUI, TR, SPC], [ENT, MO(3), RALT], (TR, TR), (TR, TR))
+    sym = [S(k) for k in nums]
+    raise_ = layer([TAB] + sym[0:5], [LCTL] + [NO] * 5, [LSFT] + [NO] * 5,
+                   sym[5:10] + [BSPC], [MINS, EQL, LBRC, RBRC, BSLS, GRV],
+                   [S(MINS), S(EQL), S(LBRC), S(RBRC), S(BSLS), S(GRV)],
+                   [LGUI, MO(3), SPC], [ENT, TR, RALT], (TR, TR), (TR, TR))
+    adjust = layer([0x7C00] + [F(i) for i in range(1, 6)], [0x7820] + [F(i) for i in range(6, 11)],
+                   [NO, F(11), F(12), NO, NO, NO],
+                   [0xA8, 0xAA, 0xA9, NO, NO, NO], [0xAC, 0xAE, 0xAB, NO, NO, NO], [NO] * 6,
+                   [LGUI, TR, SPC], [ENT, TR, RALT], (TR, TR), (TR, TR))
+    return [base, lower, raise_, adjust]
+
+
+# --------------------------------------------------------------- commands
+
+def open_keyboard(demo):
+    if demo:
+        return DemoKeyboard()
+    path, name = find_device()
+    return Keyboard(HidTransport(path), name, path)
+
+
+def read_keymap(kb, layout, layers):
+    return [{"%d,%d" % (k["row"], k["col"]): kb.get(l, k["row"], k["col"]) for k in layout}
+            for l in range(layers)]
+
+
+def load_layout(kb):
+    vial_version, definition = kb.vial_definition()
+    layout = None
+    source = "builtin"
+    if definition:
+        keymap_rows = (definition.get("layouts") or {}).get("keymap")
+        if keymap_rows:
+            layout = parse_kle(keymap_rows)
+            source = "vial"
+    if not layout:
+        layout = fallback_layout()
+    return vial_version, layout, source
+
+
+def cmd_dump(kb):
+    protocol = kb.protocol()
+    layers = kb.layer_count()
+    vial_version, layout, source = load_layout(kb)
+    return {
+        "connected": True,
+        "name": kb.name,
+        "path": kb.path,
+        "protocol": protocol,
+        "vial": vial_version,
+        "layers": layers,
+        "layoutSource": source,
+        "layout": layout,
+        "keymap": read_keymap(kb, layout, layers),
+    }
+
+
+def cmd_set(kb, args):
+    if not args or len(args) % 4:
+        raise HelperError("usage", "set takes groups of: layer row col keycode")
+    written = 0
+    rejected = []
+    for i in range(0, len(args), 4):
+        layer, row, col = (int(a) for a in args[i:i + 3])
+        code = int(args[i + 3], 0)
+        if not 0 <= code <= 0xFFFF:
+            raise HelperError("usage", "keycode out of range: %s" % args[i + 3])
+        kb.set(layer, row, col, code)
+        # Vial drops some writes without an error (QK_BOOT while the board is
+        # locked), so read back rather than trust the write.
+        actual = kb.get(layer, row, col)
+        if actual == code:
+            written += 1
+        else:
+            rejected.append({"layer": layer, "row": row, "col": col, "wanted": code, "actual": actual})
+    return {"ok": True, "written": written, "rejected": rejected}
+
+
+def cmd_backup(kb):
+    data = cmd_dump(kb)
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    path = os.path.join(BACKUP_DIR, time.strftime("%Y%m%d-%H%M%S") + (".demo" if isinstance(kb, DemoKeyboard) else "") + ".json")
+    with open(path, "w") as f:
+        json.dump({"name": data["name"], "layers": data["layers"], "keymap": data["keymap"]}, f, indent=1)
+    return {"ok": True, "path": path}
+
+
+def cmd_restore(kb, path):
+    if not path:
+        backups = sorted(glob.glob(os.path.join(BACKUP_DIR, "*.json")))
+        demo = isinstance(kb, DemoKeyboard)
+        backups = [b for b in backups if b.endswith(".demo.json") == demo]
+        if not backups:
+            raise HelperError("no-backup", "No backup to restore")
+        path = backups[-1]
+    with open(path) as f:
+        saved = json.load(f)
+    layers = min(kb.layer_count(), len(saved["keymap"]))
+    written = 0
+    for l in range(layers):
+        for pos, code in saved["keymap"][l].items():
+            row, col = (int(v) for v in pos.split(","))
+            if kb.get(l, row, col) != code:
+                kb.set(l, row, col, code)
+                written += 1
+    return {"ok": True, "path": path, "written": written}
+
+
+def emit(obj):
+    print(json.dumps(obj), flush=True)
+
+
+def cmd_watch(kb, interval=0.025, polls=None):
+    """Stream the switch matrix: a hello line, then one line per change.
+
+    Vial may hide the matrix while the board is locked, so the hello says
+    whether it is locked and which keys unlock it.
+    """
+    vial_version, definition = kb.vial_definition()
+    matrix = (definition or {}).get("matrix") or {}
+    rows = int(matrix.get("rows", DEFAULT_MATRIX[0]))
+    cols = int(matrix.get("cols", DEFAULT_MATRIX[1]))
+    unlocked, unlock_keys = kb.lock_status() if vial_version else (True, [])
+    emit({"event": "hello", "rows": rows, "cols": cols,
+          "locked": not unlocked, "unlockKeys": unlock_keys})
+    last = None
+    while polls is None or polls > 0:
+        pressed = kb.matrix(rows, cols)
+        if pressed != last:
+            emit({"event": "keys", "pressed": pressed})
+            last = pressed
+        if polls is not None:
+            polls -= 1
+        time.sleep(interval)
+
+
+def cmd_unlock(kb, interval=0.1, timeout=30.0):
+    unlocked, keys = kb.lock_status()
+    if unlocked:
+        return {"ok": True, "unlocked": True}
+    emit({"event": "unlock", "keys": keys, "counter": None})
+    kb.unlock_start()
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        unlocked, _, counter = kb.unlock_poll()
+        if unlocked:
+            return {"ok": True, "unlocked": True}
+        if counter != last:
+            emit({"event": "unlock", "keys": keys, "counter": counter})
+            last = counter
+        time.sleep(interval)
+    raise HelperError("timeout", "Unlock timed out",
+                      "Hold all the highlighted keys together until it finishes.")
+
+
+def main(argv):
+    demo = "--demo" in argv
+    argv = [a for a in argv if a != "--demo"]
+    cmd = argv[0] if argv else "dump"
+    if cmd == "udev-rule":
+        sys.stdout.write(UDEV_RULE)
+        return 0
+    try:
+        kb = open_keyboard(demo)
+        if cmd == "dump":
+            out = cmd_dump(kb)
+        elif cmd == "set":
+            args = argv[1:]
+            backup = None
+            if args and args[0] == "--backup-first":
+                args = args[1:]
+                backup = cmd_backup(kb)["path"]
+            out = cmd_set(kb, args)
+            out["backup"] = backup
+        elif cmd == "backup":
+            out = cmd_backup(kb)
+        elif cmd == "watch":
+            if demo:
+                raise HelperError("usage", "watch needs a real keyboard")
+            cmd_watch(kb)
+            return 0
+        elif cmd == "unlock":
+            if demo:
+                raise HelperError("usage", "unlock needs a real keyboard")
+            out = cmd_unlock(kb)
+        elif cmd == "restore":
+            out = cmd_restore(kb, argv[1] if len(argv) > 1 else "")
+        else:
+            raise HelperError("usage", "unknown command: " + cmd)
+    except HelperError as e:
+        out = {"connected": e.code not in ("not-found", "permission"), "ok": False,
+               "error": e.code, "message": e.message, "hint": e.hint}
+    except OSError as e:
+        out = {"connected": False, "ok": False, "error": "io", "message": str(e),
+               "hint": "The keyboard may have been unplugged."}
+    print(json.dumps(out))
+    return 0 if out.get("ok", True) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,2 @@
+# Let the logged-in user talk raw HID to foostan keyboards (Corne) for VIA/Vial remapping
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="4653", MODE="0660", TAG+="uaccess"
