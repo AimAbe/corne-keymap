@@ -1,5 +1,7 @@
 # Corne Keymap
 
+![Corne Keymap panel](screenshot.png)
+
 An Omarchy shell plugin that draws your **Corne v4** in the bar and lets you remap it live.
 Click a key, pick a keycode, and it's written straight to the keyboard over the VIA/Vial raw-HID
 protocol. There's no firmware to compile and nothing to flash.
@@ -18,8 +20,7 @@ protocol. There's no firmware to compile and nothing to flash.
 ## Install
 
 ```bash
-git clone <this repo> ~/.config/omarchy/plugins/aimabe.corne-keymap
-omarchy plugin enable aimabe.corne-keymap
+omarchy plugin add https://github.com/AimAbe/corne-keymap --enable
 ```
 
 Linux only lets root open raw HID devices by default. Allow your user to reach foostan (VID `4653`) boards:
