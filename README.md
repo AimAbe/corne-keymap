@@ -32,6 +32,16 @@ sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=hidraw
 
 (The panel has a button that copies this command.) Needs `python3`, which Omarchy ships.
 
+## Remove
+
+```bash
+omarchy plugin remove aimabe.corne-keymap
+sudo rm /etc/udev/rules.d/50-corne-keymap.rules && sudo udevadm control --reload
+rm -rf ~/.local/state/omarchy/corne-keymap   # backups and demo board
+```
+
+Removing the plugin doesn't touch the keymap on your keyboard. Restore a backup first if you want your old layout back.
+
 ## Keys
 
 | Key | Action |
