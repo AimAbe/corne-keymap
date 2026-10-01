@@ -23,7 +23,8 @@ protocol. There's no firmware to compile and nothing to flash.
 omarchy plugin add https://github.com/AimAbe/corne-keymap --enable
 ```
 
-Linux only lets root open raw HID devices by default. Allow your user to reach foostan (VID `4653`) boards:
+Linux only lets root open raw HID devices by default. Allow your user to reach Corne-layout
+boards — the USB id depends on who built them (foostan `4653`, IFKB `feee`):
 
 ```bash
 sudo install -m644 udev/50-corne-keymap.rules /etc/udev/rules.d/

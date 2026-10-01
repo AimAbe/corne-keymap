@@ -35,7 +35,8 @@ STATE_DIR = os.path.join(
 BACKUP_DIR = os.path.join(STATE_DIR, "backups")
 DEMO_FILE = os.path.join(STATE_DIR, "demo.json")
 
-FOOSTAN_VID = 0x4653  # foostan, maker of the Corne
+# Corne-layout boards don't share one USB id: 0x4653 is foostan's, 0xFEEE is IFKB's.
+KNOWN_VIDS = (0x4653, 0xFEEE)
 REPORT_SIZE = 32
 
 # VIA command ids
@@ -57,9 +58,10 @@ VIAL_UNLOCK_POLL = 0x07
 DEFAULT_MATRIX = (8, 7)
 
 UDEV_RULE = (
-    '# Let the logged-in user talk raw HID to foostan keyboards (Corne) for VIA/Vial remapping\n'
-    'KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="4653", MODE="0660", TAG+="uaccess"\n'
-)
+    '# Let the logged-in user talk raw HID to Corne-layout keyboards for VIA/Vial remapping\n'
+    "# 4653 is foostan's; feee is IFKB's, used on their Corne-layout boards.\n"
+    'KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="%s", MODE="0660", TAG+="uaccess"\n'
+) % "|".join("%04x" % vid for vid in KNOWN_VIDS)
 
 
 class HelperError(Exception):
@@ -168,7 +170,7 @@ def find_device():
     """Return (hidraw path, product name) of the best VIA-capable interface.
 
     VIA's raw HID interface is identified by usage page 0xFF60, usage 0x61 in
-    its report descriptor. Foostan's vendor id wins when several match.
+    its report descriptor. A known Corne vendor id wins when several match.
     """
     found = []
     for sys_dir in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
@@ -185,7 +187,7 @@ def find_device():
         parts = uevent.get("HID_ID", "0:0:0").split(":")
         vid = int(parts[1], 16) if len(parts) > 1 else 0
         name = uevent.get("HID_NAME", "Keyboard")
-        rank = 0 if vid == FOOSTAN_VID or "corne" in name.lower() else 1
+        rank = 0 if vid in KNOWN_VIDS or "corne" in name.lower() else 1
         found.append((rank, "/dev/" + os.path.basename(sys_dir), name))
     if not found:
         raise HelperError("not-found", "No VIA/Vial keyboard found",

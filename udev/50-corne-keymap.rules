@@ -1,2 +1,3 @@
-# Let the logged-in user talk raw HID to foostan keyboards (Corne) for VIA/Vial remapping
-KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="4653", MODE="0660", TAG+="uaccess"
+# Let the logged-in user talk raw HID to Corne-layout keyboards for VIA/Vial remapping
+# 4653 is foostan's; feee is IFKB's, used on their Corne-layout boards.
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="4653|feee", MODE="0660", TAG+="uaccess"

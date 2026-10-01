@@ -1,5 +1,5 @@
 """Protocol tests against a fake VIA/Vial board: python3 tests/test_cornectl.py"""
-import importlib.machinery, importlib.util, json, lzma, os, sys, tempfile, unittest
+import contextlib, importlib.machinery, importlib.util, io, json, lzma, os, sys, tempfile, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 loader = importlib.machinery.SourceFileLoader("cornectl", os.path.join(HERE, "..", "bin", "cornectl"))
@@ -112,6 +112,23 @@ class Tests(unittest.TestCase):
         positions = {"%d,%d" % (k["row"], k["col"]) for k in cornectl.fallback_layout()}
         for layer in cornectl.demo_keymap():
             self.assertEqual(set(layer), positions)
+
+    def test_udev_rule_matches_installed_file(self):
+        # cornectl udev-rule and udev/50-corne-keymap.rules are two copies of the
+        # same rule; the install step copies the file, so a stale print means the
+        # panel hands out a rule that grants nothing.
+        with open(os.path.join(HERE, "..", "udev", "50-corne-keymap.rules")) as f:
+            installed = f.read()
+        self.assertEqual(cornectl.UDEV_RULE, installed)
+
+    def test_udev_rule_covers_every_known_vid(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            printed = cornectl.main(["udev-rule"])
+        self.assertEqual(printed, 0)
+        self.assertEqual(buf.getvalue(), cornectl.UDEV_RULE)
+        for vid in cornectl.KNOWN_VIDS:
+            self.assertIn("%04x" % vid, cornectl.UDEV_RULE)
 
 
 if __name__ == "__main__":
