@@ -35,7 +35,8 @@ STATE_DIR = os.path.join(
 BACKUP_DIR = os.path.join(STATE_DIR, "backups")
 DEMO_FILE = os.path.join(STATE_DIR, "demo.json")
 
-KNOWN_VIDS = (0x4653, 0xFEEE)  # 0x4653 foostan; 0xFEEE stock QMK/Vial firmware
+# Corne-layout boards don't share one USB id: 0x4653 is foostan's, 0xFEEE is IFKB's.
+KNOWN_VIDS = (0x4653, 0xFEEE)
 REPORT_SIZE = 32
 
 # VIA command ids
@@ -57,8 +58,8 @@ VIAL_UNLOCK_POLL = 0x07
 DEFAULT_MATRIX = (8, 7)
 
 UDEV_RULE = (
-    '# Let the logged-in user talk raw HID to foostan keyboards (Corne) for VIA/Vial remapping\n'
-    "# 4653 is foostan's vendor id; feee is what stock QMK/Vial firmware reports.\n"
+    '# Let the logged-in user talk raw HID to Corne-layout keyboards for VIA/Vial remapping\n'
+    "# 4653 is foostan's; feee is IFKB's, used on their Corne-layout boards.\n"
     'KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="%s", MODE="0660", TAG+="uaccess"\n'
 ) % "|".join("%04x" % vid for vid in KNOWN_VIDS)
 
